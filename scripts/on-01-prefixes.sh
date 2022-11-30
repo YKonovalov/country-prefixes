@@ -1,6 +1,7 @@
 #!/bin/sh
 # Get aggregated IPv4 preffixes list for a country using RIPE IP delegation data
 set -e
+shopt -s extglob
 
 countries="RU ES DE"
 families="ipv4 ipv6"
@@ -29,7 +30,7 @@ ripe_process_ipv4(){
     xargs -n1 ipcalc --no-decorate -d |
     sort -u > "$state_dir/ipv4-$country.delegated"
   cat "$state_dir/ipv4-$country.delegated"|aggregate|sort > "$state_dir/ipv4-$country.aggregated"
-  #comm -12 "$state_dir/ipv4-$country" "$state_dir/all-advertised" > "$state_dir/ipv4-$country-advertised"
+  #comm -12 "$state_dir/ipv4-$country.aggregated" "$state_dir/all-advertised" > "$state_dir/ipv4-$country.advertised"
 }
 
 ripe_process_ipv6(){
@@ -79,19 +80,15 @@ ripe(){
     return 1
   fi
 }
-ru_cc2asn(){
-  echo ipv4 ru | nc cc2asn.com 43 | sort -u > "$state_dir/ipv4-RU-cc2asn"
-}
+
 all_advertised(){
   curl -o /tmp/prefixes_adv_pool.txt https://bgp.potaroo.net/ipv4-stats/prefixes_adv_pool.txt && \
     awk '{print $1}' /tmp/prefixes_adv_pool.txt|sort -u > "$state_dir/all-advertised"
 }
 stats(){
-  wc -l "$state_dir/ipv"*"-"*".delegated" "$state_dir/ipv"*"-"*".aggregated"
-  if [ -n "$1" ]; then
-    awk -F'.' '{print $1}' "$state_dir/ipv4-RU.aggregated"|sort -g|uniq -c
-  fi
+  wc -l "$state_dir/ipv"?-*.@(delegated|aggregated|advertised)
 }
 
+#all_advertised 
 ripe
 stats

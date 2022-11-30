@@ -2,7 +2,7 @@
 D=`dirname $0`
 
 myip(){
-  curl ifconfig.me
+  curl ifconfig.me && echo
 }
 sh "$D/on-01-prefixes.sh"
 sh "$D/on-02-table-RU-v4.sh"
