@@ -1,0 +1,564 @@
+#!/bin/bash
+# Get countries IPv4/IPv6 prefixes from RIRs (Regional Internet Registry)
+set -e
+shopt -s extglob
+
+### Defaults
+countries="RU ES DE US FI NL"
+families="ipv4 ipv6"
+registries="ripe arin"
+
+#ID table_id nexthop_id
+counties_ids='
+RU 101 101 201
+ES 102 102 202
+DE 103 103 203
+US 104 102 202
+FI 105 105 205
+NL 106 106 206
+'
+
+counties_ids='
+RU 101 101 201
+US 104 102 202
+'
+default_config=/etc/country-prefixes.conf
+
+output_dir="/var/lib/country-prefixes"
+state_dir="/var/lib/country-prefixes-data"
+### End of defaults
+
+rt_table_file="/etc/iproute2/rt_tables.d/country-prefixes.conf"
+
+IPCALC=
+AGGREGATE=
+SOURCE_UPDATED=
+
+mkdir -p "$state_dir" "$output_dir"
+
+env_afrinic(){
+  rir=afrinic
+  table_url="https://ftp.afrinic.net/pub/stats/afrinic/delegated-afrinic-extended-latest"
+  checksum_url="https://ftp.afrinic.net/pub/stats/afrinic/delegated-afrinic-extended-latest.md5"
+  extended=1
+  name="AFRINIC"
+  full="African Network Information Centre"
+  description="Serves Africa and parts of the Indian Ocean."
+  checksum="$state_dir/delegated-afrinic-extended-latest.md5"
+  checksum_prev="$state_dir/delegated-afrinic-extended-latest.prev.md5"
+  table="$state_dir/delegated-afrinic-extended-latest"
+}
+env_apnic(){
+  rir=apnic
+  table_url="https://ftp.apnic.net/stats/apnic/delegated-apnic-extended-latest"
+  checksum_url="https://ftp.apnic.net/stats/apnic/delegated-apnic-extended-latest.md5"
+  extended=1
+  name="APNIC"
+  full="Asia-Pacific Network Information Centre"
+  description="Serves East, South, Southeast Asia, and Oceania."
+  checksum="$state_dir/delegated-apnic-extended-latest.md5"
+  checksum_prev="$state_dir/delegated-apnic-extended-latest.prev.md5"
+  table="$state_dir/delegated-apnic-extended-latest"
+}
+env_arin(){
+  rir=arin
+  table_url="https://ftp.arin.net/pub/stats/arin/delegated-arin-extended-latest"
+  checksum_url="https://ftp.arin.net/pub/stats/arin/delegated-arin-extended-latest.md5"
+  extended=1
+  name="ARIN"
+  full="American Registry for Internet Numbers"
+  description="Serves Canada, the United States, and many Caribbean/North Atlantic islands."
+  checksum="$state_dir/delegated-arin-extended-latest.md5"
+  checksum_prev="$state_dir/delegated-arin-extended-latest.prev.md5"
+  table="$state_dir/delegated-arin-extended-latest"
+}
+env_lacnic(){
+  rir=lacnic
+  table_url="https://ftp.lacnic.net/pub/stats/lacnic/delegated-lacnic-extended-latest"
+  checksum_url="https://ftp.lacnic.net/pub/stats/lacnic/delegated-lacnic-extended-latest.md5"
+  extended=1
+  name="LACNIC"
+  full="Latin America and Caribbean Network Information Centre"
+  description="Serves Latin America and parts of the Caribbean."
+  checksum="$state_dir/delegated-lacnic-extended-latest.md5"
+  checksum_prev="$state_dir/delegated-lacnic-extended-latest.prev.md5"
+  table="$state_dir/delegated-lacnic-extended-latest"
+}
+env_ripe(){
+  rir=ripe
+  table_url="https://ftp.ripe.net/ripe/stats/delegated-ripencc-latest"
+  checksum_url="https://ftp.ripe.net/ripe/stats/delegated-ripencc-latest.md5"
+  extended=
+  name="RIPE NCC"
+  full="Réseaux IP Européens Network Coordination Centre"
+  description="Serves Europe, the Middle East, and Central Asia."
+  checksum="$state_dir/delegated-ripencc-latest.md5"
+  checksum_prev="$state_dir/delegated-ripencc-latest.prev.md5"
+  table="$state_dir/delegated-ripencc-latest"
+}
+
+check_rirs_supported(){
+  local type="$1"
+  local rirs="$2"
+  local A=`echo $rirs|tr ' ' '\n'|sort -u`
+  local B=`echo $supported_rirs|tr ' ' '\n'|sort -u`
+  local filtred_rirs=`comm -12 <(echo "$A") <(echo "$B")`
+  if [ -z "$filtred_rirs" ]; then
+    error "None of the $type rirs ($(echo $rirs)) are supported ($(echo $supported_rirs))"
+    return 1
+  elif [ "$(echo $rirs|tr ' ' '\n'|sort -u)" != "$(echo $filtred_rirs|tr ' ' '\n'|sort -u)" ]; then
+    bad=`comm -23 <(echo "$A") <(echo "$B")`
+    error "Some of the $type rirs ($(echo $rirs)) are not supported: ($(echo $bad))"
+    return 2
+  fi
+  echo $filtred_rirs
+}
+
+error(){
+  echo "E: $@" >&2
+}
+
+msg(){
+  [ -n "$verbose" ] && echo "$@" >&2 ||:
+}
+
+check_tools(){
+  IPCALC_NAME="$(. /etc/os-release; [ "$ID_LIKE" == "debian" ] && echo ipcalc-ng || echo ipcalc)"
+  if ! IPCALC="$(which "$IPCALC_NAME")"; then
+    error "No $IPCALC_NAME found."
+    return 1
+  fi
+  if ! AGGREGATE="$(which aggregate)"; then
+    error "No aggregate found."
+    return 2
+  fi
+}
+
+rt_table() {
+  local rt=`mktemp`
+  echo "$counties_ids"|awk 'NF {print $2"	"$1}' > $rt
+  if ! diff -q "$rt" "$rt_table_file" 2>/dev/null; then
+    echo "UP RT_TABLE"
+    cat "$rt" > "$rt_table_file"
+  fi
+}
+
+routes4() {
+  local country
+  local table
+  local next_hop
+  local prefixes="$output_dir/ipv4-$country"
+  local routes="$output_dir/ipv4.routes"
+  echo "$counties_ids"|awk NF|while read country table next_hop4 next_hop6; do
+    prefixes="$output_dir/ipv4-$country"
+    awk -v table="$table" -v next_hop="$next_hop4" \
+      '{print "route replace table", table, $1, "nhid", next_hop}' \
+      "$output_dir/ipv4-$country"
+  done > "$routes"
+  wc -l "$routes"
+  \time -f "%e sec to load fib4" ip -batch "$routes"
+
+}
+routes6() {
+  local country
+  local table
+  local next_hop
+  local prefixes="$output_dir/ipv6-$country"
+  local routes="$output_dir/ipv6.routes"
+  echo "$counties_ids"|awk NF|while read country table next_hop4 next_hop6; do
+    prefixes="$output_dir/ipv6-$country"
+    awk -v table="$table" -v next_hop="$next_hop6" \
+      '{print "route replace table", table, $1, "nhid", next_hop}' \
+      "$output_dir/ipv6-$country"
+  done > "$routes"
+  wc -l "$routes"
+  \time -f "%e sec to load fib6" ip -batch "$routes"
+}
+
+sync_routes() {
+wc -l "$routes"
+echo `ip route show table $table|wc -l`" in fib"
+\time -f "%e sec to load fib" ip -batch "$routes"
+echo `ip route show table $table|wc -l`" in fib"
+}
+
+process_ipv4(){
+  local country="$1"
+  local table="$2"
+  local registry="$3"
+  awk -F '|' -v country="$country" -v family="ipv4" \
+        '$2==country && $3==family {split($4,a,"."); u32=((a[1]*256+a[2])*256+a[3])*256+a[4]; printf("%s %08x\n",$4,u32+$5-1) }' "$table"|
+    awk '{gsub(/../, "0x& ", $2); print $1,$2}'|
+    awk '{print $1"-"strtonum($2)"."strtonum($3)"."strtonum($4)"."strtonum($5)}'|
+    xargs -rn1 $IPCALC --no-decorate -d |
+    sort -u > "$state_dir/ipv4-$country.$registry.delegated"
+  cat "$state_dir/ipv4-$country.$registry.delegated"|$AGGREGATE|sort > "$state_dir/ipv4-$country.$registry.aggregated"
+  #comm -12 "$state_dir/ipv4-$country.aggregated" "$state_dir/all-advertised" > "$state_dir/ipv4-$country.advertised"
+}
+
+process_ipv6(){
+  local country="$1"
+  local table="$2"
+  local registry="$3"
+  awk -F '|' -v country="$country" -v family="ipv6" \
+        '$2==country && $3==family {print $4"/"$5}' "$table"|
+    sort -u > "$state_dir/ipv6-$country.$registry.delegated"
+  #cat "$state_dir/ipv6-$country.delegated"|$AGGREGATE|sort > "$state_dir/ipv6-$country.aggregated"
+  #comm -12 "$state_dir/ipv4-$country" "$state_dir/all-advertised" > "$state_dir/ipv4-$country-advertised"
+}
+
+aggregate_all(){
+  local country
+  for country in $countries; do
+    cat "$state_dir/ipv4-$country."*".aggregated"|$AGGREGATE|sort |
+      tee "$state_dir/ipv4-$country.aggregated" > "$output_dir/ipv4-$country"
+    cat "$state_dir/ipv6-$country."*".delegated"|sort -u |
+      tee "$state_dir/ipv6-$country.delegated" > "$output_dir/ipv6-$country"
+  done
+}
+update_coutries(){
+  local rir="$1"
+  (
+  env_$rir
+  for country in $countries; do
+    for family in $families; do
+        case $family in
+        "ipv4")
+          p=aggregated
+          true
+          ;;
+        "ipv6")
+          p=delegated
+          true
+          ;;
+        *)
+          echo "Family $family not known"
+          return 3
+        ;;
+        esac
+        if [ -f $state_dir/$family-$country.$rir.$p ]; then
+          msg "OK $rir $country $family"
+        else
+          msg "UP $rir $country $family $table"
+          process_$family $country "$table" "$rir"
+        fi
+    done
+  done
+  )
+}
+
+update_rir_data(){
+  local rir="$1"
+  env_$rir
+  if ! curl -s -o "$checksum" "$checksum_url"; then
+    error "failed to download checksum file for rir: $rir"
+  fi
+  sed -i "s/-[0-9]\+$/-latest/" "$checksum"
+  if [ -f "$checksum_prev" ] && diff -q "$checksum" "$checksum_prev"; then
+    echo "OK $table"
+    return
+  fi
+
+  if curl -s -o "$table" "$table_url"; then
+    if ! (cd "$state_dir"; md5sum -c "$checksum"); then
+      error "checksum mismatch for $table"
+      return 2
+    fi
+    echo "UP $table"
+    SOURCE_UPDATED=y
+    mv "$checksum" "$checksum_prev"
+    update_coutries $rir
+  else
+    error "$table_url download failed"
+    return 1
+  fi
+}
+
+all_advertised(){
+  curl -o /tmp/prefixes_adv_pool.txt https://bgp.potaroo.net/ipv4-stats/prefixes_adv_pool.txt && \
+    awk '{print $1}' /tmp/prefixes_adv_pool.txt|sort -u > "$state_dir/all-advertised"
+}
+stats(){
+  wc -l "$state_dir/ipv"?-*.@(delegated|aggregated|advertised)
+}
+stats4(){
+  echo
+  for country in $countries; do
+    wc --total=never -l "$state_dir/ipv4-"$country*".aggregated"|sort -n -k1 -k2r
+    echo
+  done
+}
+
+stats6(){
+  echo
+  for country in $countries; do
+    wc --total=never -l "$state_dir/ipv6-"$country*".delegated"|sort -n -k1 -k2r
+    echo
+  done
+}
+stats_total(){
+  echo Total prefixes:
+  wc --total=never -l "$state_dir/ipv4-"??".aggregated"|sort -nr
+  echo
+  wc --total=never -l "$state_dir/ipv6-"??".delegated" |sort -nr
+}
+stats_final(){
+  echo
+  wc  --total=never -l "$output_dir"/ipv4*|sort -rn
+  echo
+  wc  --total=never -l "$output_dir"/ipv6*|sort -rn
+}
+
+clean_cache(){
+  rm -f "$state_dir"/* "$output_dir"/*
+}
+
+country_id(){
+  local country="$1"
+  local cl=`locale -a|grep "_$country$"|head -1`
+  (LANG=$cl locale -k LC_TELEPHONE|awk -F= '$1=="int_prefix" {print $2}'|tr -d '"')
+}
+
+readConfig(){
+  local config="$1"
+    msg "Using config file $config"
+    . "$config"
+}
+configPrint(){
+  msg " countries: $countries"
+  msg "  families: $families"
+  msg "registries: $registries"
+}
+rirsPrint(){
+  msg " supported: $(echo $supported_rirs)"
+  msg "configured: $(echo $configured_rirs)"
+  msg "  included: $(echo $included_rirs)"
+  msg "  excluded: $(echo $excluded_rirs)"
+  msg "  selected: $(echo $use_rirs)"
+}
+
+usage() {
+  cat >&2 << EOF
+Usage: $PROG [ OPTIONS ]
+
+Modes:
+    --install         - install required commands and systemd units
+    --init            - init dataplane modules,settings,routing tables and VRFs
+    --create          - create all required tunnels/vrfs according to config
+    --delete          - destroy all tunnels, VRFs and configs
+    -m|--monitor      - monitor and appy routes
+
+Modifiers:
+    -q|--quiet        - minimal output
+    --debug           - debug output
+    --dryrun          - show commands without actually running them
+
+Basic info:
+    -h|--help         - show this message
+    --config-example  - show example config file
+    --config-check    - read and print data from config file
+    -s|--status       - show controlplane and dataplane status
+
+Prefixes stats:
+    --stats4          - show BGP peers info
+    --stats6          - show inet/inet6 routes recieved from peers
+    --stats           - show inet/inet6 routes announced to peers
+    --route-stats     - show route-targets recieved from peers
+    --peer-rtc-out    - show route-targets announced to peers
+
+VRFs and routes
+    -r|--rt-list     - show VRFs info in controlplane and dataplane
+    -l|--list         - list currently installed routes in controlplane and dataplane
+    -L|--listdetail   - list routes more detailed
+    --sync            - cleanup stale routes in dataplane
+
+EOF
+}
+
+
+check_tools
+
+PROG="${PROG:-${0##*/}}"
+
+if TEMP=`getopt -n "$PROG" -o "hqc:drtsi:e:fl" -l "help,debug,quiet,dryrun,no-pager,status,force,stats,config:,delete,list-rirs,include-rir:,exclude-rir:,rirs,countries,tables,routes,sync" -- "$@"`; then
+  eval set -- "$TEMP"
+else
+  usage
+  exit 1
+fi
+
+debug=
+verbose=1
+dryrun=
+nopager=
+irirs=
+erirs=
+
+while :; do
+    case "$1" in
+    --help|-h)
+        usage
+        exit
+        ;;
+    --debug)
+        debug=1
+        info=1
+        ;;
+    -q|--quiet)
+        verbose=
+        ;;
+    --dryrun)
+        dryrun=1
+        ;;
+    --force|-f)
+        force=1
+        ;;
+    --delete|-d)
+        delete=1
+        ;;
+    --stats|-s)
+        stats=1
+        ;;
+    --rirs)
+        dorirs=1
+        ;;
+    --countries)
+        docountries=1
+        ;;
+    --routes|-r)
+        doroutes=1
+        ;;
+    --list-rirs|-l)
+        list_rirs=1
+        ;;
+    --exclude-rir|-e)
+        exclude_rir=1
+        shift
+        erirs="$erirs $1"
+        ;;
+    --include-rir|-i)
+        include_rir=1
+        shift
+        irirs="$irirs $1"
+        ;;
+    --config|-c)
+        shift
+        configc=1
+        config="$1"
+        ;;
+    --)
+        shift
+        break
+        ;;
+  esac
+  shift
+done
+
+if [ -n "$configc" ]; then
+  if [ -f "$config" ]; then
+    readConfig "$config"
+  else
+    error "Config file specified not found: $config"
+    exit 1
+  fi
+elif [ -f "$default_config" ]; then
+  readConfig "$default_config"
+fi
+configPrint
+
+if [ -n "$delete" ]; then
+  clean_cache
+  exit
+fi
+
+if [ -n "$force" ]; then
+  clean_cache
+fi
+
+supported_rirs="$(declare -F|awk '{print $3}'|sed -n "s/^env_//p"||:)"
+configured_rirs=
+included_rirs=
+excluded_rirs=
+
+use_rirs="$supported_rirs"
+
+if [ -n "$registries" ]; then
+  configured_rirs=`check_rirs_supported configured "$registries"`
+  use_rirs="$configured_rirs"
+fi
+
+if [ -n "$include_rir" ]; then
+  included_rirs=`check_rirs_supported included "$irirs"`
+  use_rirs=`echo $use_rirs $included_rirs|tr ' ' '\n'|sort -u`
+fi
+
+if [ -n "$exclude_rir" ]; then
+  excluded_rirs=`check_rirs_supported excluded "$erirs"`
+  A=`echo $erirs|tr ' ' '\n'|sort -u`
+  B=`echo $use_rirs|tr ' ' '\n'|sort -u`
+  use_rirs=`comm -13 <(echo "$A") <(echo "$B")`
+fi
+if [ -z "$use_rirs" ]; then
+    error "None of the RiRs are selected ($(echo $use_rirs)). Supported ($(echo $supported_rirs))"
+    exit 8
+fi
+
+if [ -n "$list_rirs" ]; then
+  rirsPrint
+  exit
+fi
+
+if [ -n "$dorirs" ]; then
+  for rir in $use_rirs; do
+    update_rir_data $rir
+    update_coutries $rir
+  done
+  if [ -n "$SOURCE_UPDATED" ]; then
+    aggregate_all
+    stats_final
+  fi
+  exit
+fi
+
+if [ -n "$docountries" ]; then
+  for rir in $use_rirs; do
+    update_coutries $rir
+  done
+  if [ -n "$SOURCE_UPDATED" ]; then
+    aggregate_all
+    stats_final
+  fi
+  exit
+fi
+
+if [ -n "$doroutes" ]; then
+  rt_table
+  routes4
+  routes6
+  exit
+fi
+
+if [ -n "$stats" ]; then
+  stats4
+  stats6
+  stats_final
+  exit
+fi
+
+
+for rir in $use_rirs; do
+  update_rir_data $rir
+done
+
+for rir in $use_rirs; do
+  update_coutries $rir
+done
+
+if [ -n "$SOURCE_UPDATED" ]; then
+  aggregate_all
+fi
+
+stats_final
+rt_table
+routes4
+routes6
