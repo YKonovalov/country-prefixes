@@ -1,6 +1,8 @@
 [Unit]
 Description=Get countries IPv4/IPv6 prefixes from RIRs (Regional Internet Registry)
+After=network-online.target
 
 [Service]
 Type=oneshot
+RemainAfterExit=yes
 ExecStart=/usr/local/bin/country-prefixes -c /etc/country-prefixes.conf
